@@ -5,6 +5,8 @@ import re
 import uuid
 from typing import Dict, Any, Optional, List, Tuple, Union
 
+from PIL import Image
+
 import ayon_api
 
 
@@ -76,25 +78,36 @@ class AyonPublisher:
             # Get next version
             next_version = self._get_next_version(project_name, product_id)
 
+
+            # Detect sequences in the files
+            sequences = self._detect_sequence(file_paths)
+
+            # Determine resolution only when publishing sequences
+            res_width = None
+            res_height = None
+            for files in sequences.values():
+                if len(files) > 1:
+                    try:
+                        with Image.open(files[0]) as img:
+                            res_width, res_height = img.size
+                    except Exception:
+                        pass
+                    break
+
             # Get project anatomy
             anatomy_data = self._get_project_anatomy(project_name)
             publish_root, template = self._get_template(anatomy_data, product_type)
 
             # Create version
             version_id = self._create_version(
-                project_name, product_id, next_version, description
+                project_name,
+                product_id,
+                next_version,
+                description,
+                res_width,
+                res_height,
             )
 
-            # Detect sequences in the files
-            sequences = self._detect_sequence(file_paths)
-
-            # If representation_names not provided, derive from file extensions
-            if not representation_names:
-                representation_names = []
-                for file_path in file_paths:
-                    ext = os.path.splitext(file_path)[1].lstrip('.')
-                    if ext not in representation_names:
-                        representation_names.append(ext)
 
             # Process each sequence or single file
             representation_ids = []
@@ -103,25 +116,42 @@ class AyonPublisher:
             for pattern, files in sequences.items():
                 is_sequence = len(files) > 1
 
-                # Determine representation name from file extension
+                # Use file basename as representation name to avoid collisions
+                base_name = os.path.splitext(os.path.basename(files[0]))[0]
                 file_ext = os.path.splitext(files[0])[1].lstrip('.')
-                representation_name = file_ext.lower()
+                representation_name = base_name
 
                 if is_sequence:
                     # Handle sequence publishing
                     result = self._publish_sequence(
-                        project_name, folder_path, product_name, product_type,
-                        files, representation_name, version_id, next_version,
-                        template, publish_root
+                        project_name,
+                        folder_path,
+                        product_name,
+                        product_type,
+                        files,
+                        representation_name,
+                        file_ext,
+                        version_id,
+                        next_version,
+                        template,
+                        publish_root,
                     )
                     representation_ids.append(result["representation_id"])
                     publish_paths.extend(result["publish_paths"])
                 else:
                     # Handle single file publishing
                     result = self._publish_single_file(
-                        project_name, folder_path, product_name, product_type,
-                        files[0], representation_name, version_id, next_version,
-                        template, publish_root
+                        project_name,
+                        folder_path,
+                        product_name,
+                        product_type,
+                        files[0],
+                        representation_name,
+                        file_ext,
+                        version_id,
+                        next_version,
+                        template,
+                        publish_root,
                     )
                     representation_ids.append(result["representation_id"])
                     publish_paths.append(result["publish_path"])
@@ -272,7 +302,13 @@ class AyonPublisher:
         return publish_root, template
 
     def _create_version(
-            self, project_name: str, product_id: str, version_number: int, description: Optional[str] = None
+            self,
+            project_name: str,
+            product_id: str,
+            version_number: int,
+            description: Optional[str] = None,
+            resolution_width: Optional[int] = None,
+            resolution_height: Optional[int] = None,
     ) -> str:
         """Create a new version."""
         author = (
@@ -290,6 +326,14 @@ class AyonPublisher:
             "attrib": {},
             "data": {"comment": description or ""},
         }
+
+        if resolution_width is not None and resolution_height is not None:
+            version_data["attrib"].update(
+                {
+                    "resolutionWidth": resolution_width,
+                    "resolutionHeight": resolution_height,
+                }
+            )
 
         self.logger.debug(f"[VERSION] Creation payload: {json.dumps(version_data, indent=2)}")
         version_id = ayon_api.create_version(project_name, **version_data)
@@ -356,6 +400,7 @@ class AyonPublisher:
             product_name: str,
             product_type: str,
             representation_name: str,
+            file_ext: str,
             version: int,
             template: Dict[str, Any],
             publish_root: Dict[str, Any],
@@ -395,7 +440,7 @@ class AyonPublisher:
                 "frame": frame,
                 "udim": udim,
                 "representation": representation_name,
-                "ext": representation_name,
+                "ext": file_ext,
                 "originalBasename": os.path.splitext(os.path.basename(file_path))[0],
                 "output": output,
                 "exr": "jpg",
@@ -429,10 +474,10 @@ class AyonPublisher:
             filename = filename.replace("__", "_").strip("_")
 
             # Ensure we don't have double extensions
-            if filename.endswith(f".{representation_name}.{representation_name}"):
+            if filename.endswith(f".{file_ext}.{file_ext}"):
                 filename = filename.replace(
-                    f".{representation_name}.{representation_name}",
-                    f".{representation_name}",
+                    f".{file_ext}.{file_ext}",
+                    f".{file_ext}",
                 )
 
             publish_path = os.path.normpath(os.path.join(publish_dir, filename))
@@ -529,6 +574,7 @@ class AyonPublisher:
             product_type: str,
             files: List[str],
             representation_name: str,
+            file_ext: str,
             version_id: str,
             version_number: int,
             template: Dict[str, Any],
@@ -554,10 +600,12 @@ class AyonPublisher:
                 product_name=product_name,
                 product_type=product_type,
                 representation_name=representation_name,
+                file_ext=file_ext,
                 version=version_number,
                 template=template,
                 frame=frame,
                 publish_root=publish_root,
+                output=representation_name,
             )
 
             # Copy file to publish location
@@ -597,6 +645,7 @@ class AyonPublisher:
             product_type: str,
             file_path: str,
             representation_name: str,
+            file_ext: str,
             version_id: str,
             version_number: int,
             template: Dict[str, Any],
@@ -611,9 +660,11 @@ class AyonPublisher:
             product_name=product_name,
             product_type=product_type,
             representation_name=representation_name,
+            file_ext=file_ext,
             version=version_number,
             template=template,
             publish_root=publish_root,
+            output=representation_name,
         )
 
         # Copy file to publish location
