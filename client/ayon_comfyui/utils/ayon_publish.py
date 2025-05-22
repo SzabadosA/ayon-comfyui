@@ -5,6 +5,8 @@ import re
 import uuid
 from typing import Dict, Any, Optional, List, Tuple, Union
 
+from PIL import Image
+
 import ayon_api
 
 
@@ -76,13 +78,28 @@ class AyonPublisher:
             # Get next version
             next_version = self._get_next_version(project_name, product_id)
 
+            # Determine resolution from the first file
+            first_file = file_paths[0]
+            res_width = None
+            res_height = None
+            try:
+                with Image.open(first_file) as img:
+                    res_width, res_height = img.size
+            except Exception:
+                pass
+
             # Get project anatomy
             anatomy_data = self._get_project_anatomy(project_name)
             publish_root, template = self._get_template(anatomy_data, product_type)
 
             # Create version
             version_id = self._create_version(
-                project_name, product_id, next_version, description
+                project_name,
+                product_id,
+                next_version,
+                description,
+                res_width,
+                res_height,
             )
 
             # Detect sequences in the files
@@ -272,7 +289,13 @@ class AyonPublisher:
         return publish_root, template
 
     def _create_version(
-            self, project_name: str, product_id: str, version_number: int, description: Optional[str] = None
+            self,
+            project_name: str,
+            product_id: str,
+            version_number: int,
+            description: Optional[str] = None,
+            resolution_width: Optional[int] = None,
+            resolution_height: Optional[int] = None,
     ) -> str:
         """Create a new version."""
         author = (
@@ -290,6 +313,14 @@ class AyonPublisher:
             "attrib": {},
             "data": {"comment": description or ""},
         }
+
+        if resolution_width is not None and resolution_height is not None:
+            version_data["attrib"].update(
+                {
+                    "resolutionWidth": resolution_width,
+                    "resolutionHeight": resolution_height,
+                }
+            )
 
         self.logger.debug(f"[VERSION] Creation payload: {json.dumps(version_data, indent=2)}")
         version_id = ayon_api.create_version(project_name, **version_data)
