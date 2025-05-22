@@ -5,6 +5,8 @@ import re
 import uuid
 from typing import Dict, Any, Optional, List, Tuple, Union
 
+from PIL import Image
+
 import ayon_api
 
 
@@ -41,7 +43,9 @@ class AyonPublisher:
             folder_path: AYON folder path
             product_name: Name of the product to create or use
             product_type: Type of product (default: "image")
-            representation_names: List of representation names (derived from file extensions if None)
+            representation_names: Optional custom representation names. If not
+                provided, representation names are derived from the basename of
+                the published files.
             description: Optional description for the version
 
         Returns:
@@ -76,25 +80,34 @@ class AyonPublisher:
             # Get next version
             next_version = self._get_next_version(project_name, product_id)
 
+            # Determine resolution from the first file
+            first_file = file_paths[0]
+            res_width = None
+            res_height = None
+            try:
+                with Image.open(first_file) as img:
+                    res_width, res_height = img.size
+            except Exception:
+                pass
+
             # Get project anatomy
             anatomy_data = self._get_project_anatomy(project_name)
             publish_root, template = self._get_template(anatomy_data, product_type)
 
             # Create version
             version_id = self._create_version(
-                project_name, product_id, next_version, description
+                project_name,
+                product_id,
+                next_version,
+                description,
+                res_width,
+                res_height,
             )
 
             # Detect sequences in the files
             sequences = self._detect_sequence(file_paths)
 
-            # If representation_names not provided, derive from file extensions
-            if not representation_names:
-                representation_names = []
-                for file_path in file_paths:
-                    ext = os.path.splitext(file_path)[1].lstrip('.')
-                    if ext not in representation_names:
-                        representation_names.append(ext)
+
 
             # Process each sequence or single file
             representation_ids = []
@@ -103,16 +116,22 @@ class AyonPublisher:
             for pattern, files in sequences.items():
                 is_sequence = len(files) > 1
 
-                # Determine representation name from file extension
                 file_ext = os.path.splitext(files[0])[1].lstrip('.')
-                representation_name = file_ext.lower()
+
+                if is_sequence:
+                    prefix, _ = self._extract_frame_info(files[0])
+                    rep_base = prefix.rstrip('.') if prefix else os.path.splitext(os.path.basename(files[0]))[0]
+                else:
+                    rep_base = os.path.splitext(os.path.basename(files[0]))[0]
+
+                representation_name = rep_base
 
                 if is_sequence:
                     # Handle sequence publishing
                     result = self._publish_sequence(
                         project_name, folder_path, product_name, product_type,
                         files, representation_name, version_id, next_version,
-                        template, publish_root
+                        template, publish_root, file_ext
                     )
                     representation_ids.append(result["representation_id"])
                     publish_paths.extend(result["publish_paths"])
@@ -121,7 +140,7 @@ class AyonPublisher:
                     result = self._publish_single_file(
                         project_name, folder_path, product_name, product_type,
                         files[0], representation_name, version_id, next_version,
-                        template, publish_root
+                        template, publish_root, file_ext
                     )
                     representation_ids.append(result["representation_id"])
                     publish_paths.append(result["publish_path"])
@@ -207,6 +226,15 @@ class AyonPublisher:
             self.logger.debug(f"[PRODUCT] Creation payload: {json.dumps(product_data, indent=2)}")
             product = ayon_api.create_product(project_name, **product_data)
             self.logger.info("[PRODUCT] Created new product successfully")
+
+            # Some AYON versions return only an ID when creating a product
+            if isinstance(product, str):
+                product = ayon_api.get_product_by_name(
+                    project_name=project_name,
+                    product_name=product_name,
+                    folder_id=folder_id,
+                )
+
             return product
         except Exception as e:
             self.logger.error(f"Product operation failed: {str(e)}")
@@ -217,8 +245,11 @@ class AyonPublisher:
         self.logger.info(f"[VERSION] Getting versions for product {product_id}")
         try:
             versions = ayon_api.get_versions(project_name, product_ids=[product_id])
+            version_numbers = []
             if versions:
-                version_numbers = [v["version"] for v in versions]
+                version_numbers = [v.get("version") for v in versions if isinstance(v, dict) and "version" in v]
+
+            if version_numbers:
                 next_version = max(version_numbers) + 1
                 self.logger.info(f"[VERSION] Found versions: {version_numbers}")
             else:
@@ -272,7 +303,13 @@ class AyonPublisher:
         return publish_root, template
 
     def _create_version(
-            self, project_name: str, product_id: str, version_number: int, description: Optional[str] = None
+            self,
+            project_name: str,
+            product_id: str,
+            version_number: int,
+            description: Optional[str] = None,
+            resolution_width: Optional[int] = None,
+            resolution_height: Optional[int] = None,
     ) -> str:
         """Create a new version."""
         author = (
@@ -290,6 +327,14 @@ class AyonPublisher:
             "attrib": {},
             "data": {"comment": description or ""},
         }
+
+        if resolution_width is not None and resolution_height is not None:
+            version_data["attrib"].update(
+                {
+                    "resolutionWidth": resolution_width,
+                    "resolutionHeight": resolution_height,
+                }
+            )
 
         self.logger.debug(f"[VERSION] Creation payload: {json.dumps(version_data, indent=2)}")
         version_id = ayon_api.create_version(project_name, **version_data)
@@ -359,11 +404,18 @@ class AyonPublisher:
             version: int,
             template: Dict[str, Any],
             publish_root: Dict[str, Any],
+            file_ext: str = "",
             udim: str = "",
             frame: str = "",
             output: str = "",
     ) -> str:
-        """Construct publish path using anatomy templates, handling empty optional fields."""
+        """Construct publish path using anatomy templates, handling empty optional fields.
+
+        Parameters
+        ----------
+        file_ext: str
+            Actual file extension used for the output file.
+        """
         self.logger.info("[PATH] Constructing publish path")
         try:
             self.logger.debug(f"[PATH] Using template: {template}")
@@ -395,7 +447,7 @@ class AyonPublisher:
                 "frame": frame,
                 "udim": udim,
                 "representation": representation_name,
-                "ext": representation_name,
+                "ext": file_ext or representation_name,
                 "originalBasename": os.path.splitext(os.path.basename(file_path))[0],
                 "output": output,
                 "exr": "jpg",
@@ -532,9 +584,16 @@ class AyonPublisher:
             version_id: str,
             version_number: int,
             template: Dict[str, Any],
-            publish_root: Dict[str, Any]
+            publish_root: Dict[str, Any],
+            file_ext: str
     ) -> Dict[str, Any]:
-        """Publish a sequence of files."""
+        """Publish a sequence of files.
+
+        Parameters
+        ----------
+        file_ext: str
+            Extension used for the published files.
+        """
         # Get frame numbers for sequence
         first_file = files[0]
         _, first_frame = self._extract_frame_info(first_file)
@@ -558,6 +617,7 @@ class AyonPublisher:
                 template=template,
                 frame=frame,
                 publish_root=publish_root,
+                file_ext=file_ext,
             )
 
             # Copy file to publish location
@@ -600,9 +660,16 @@ class AyonPublisher:
             version_id: str,
             version_number: int,
             template: Dict[str, Any],
-            publish_root: Dict[str, Any]
+            publish_root: Dict[str, Any],
+            file_ext: str
     ) -> Dict[str, Any]:
-        """Publish a single file."""
+        """Publish a single file.
+
+        Parameters
+        ----------
+        file_ext: str
+            Extension used for the published file.
+        """
         # Construct publish path
         publish_path = self._construct_publish_path(
             file_path=file_path,
@@ -614,6 +681,7 @@ class AyonPublisher:
             version=version_number,
             template=template,
             publish_root=publish_root,
+            file_ext=file_ext,
         )
 
         # Copy file to publish location
