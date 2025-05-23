@@ -3,6 +3,7 @@ import json
 import shutil
 import re
 import uuid
+from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple, Union
 
 from PIL import Image
@@ -78,6 +79,23 @@ class AyonPublisher:
             # Get next version
             next_version = self._get_next_version(project_name, product_id)
 
+            # Detect sequences in the files
+            sequences = self._detect_sequence(file_paths)
+
+            frame_start = frame_end = None
+            for seq_files in sequences.values():
+                _, start = self._extract_frame_info(seq_files[0])
+                _, end = self._extract_frame_info(seq_files[-1])
+                if start is not None:
+                    frame_start = start if frame_start is None else min(frame_start, start)
+                if end is not None:
+                    frame_end = end if frame_end is None else max(frame_end, end)
+
+            if frame_start is None:
+                frame_start = 1
+            if frame_end is None:
+                frame_end = frame_start
+
             # Determine resolution from the first file
             first_file = file_paths[0]
             res_width = None
@@ -100,10 +118,9 @@ class AyonPublisher:
                 description,
                 res_width,
                 res_height,
+                frame_start,
+                frame_end,
             )
-
-            # Detect sequences in the files
-            sequences = self._detect_sequence(file_paths)
 
             # If representation_names not provided, derive from file extensions
             if not representation_names:
@@ -326,6 +343,9 @@ class AyonPublisher:
             description: Optional[str] = None,
             resolution_width: Optional[int] = None,
             resolution_height: Optional[int] = None,
+            frame_start: Optional[int] = None,
+            frame_end: Optional[int] = None,
+            fps: float = 25.0,
     ) -> str:
         """Create a new version."""
         author = (
@@ -340,9 +360,26 @@ class AyonPublisher:
             "product_id": product_id,
             "author": author,
             "status": "Pending review",
-            "attrib": {},
-            "data": {"comment": description or ""},
+            "step": 1,
+            "time": datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"),
+            "attrib": {
+                "fps": fps,
+                "clipIn": 1,
+                "clipOut": 1,
+                "pixelAspect": 1.0,
+                "handleStart": 0,
+                "handleEnd": 0,
+            },
+            "data": {
+                "comment": description or "",
+                "colorspace": "scene_linear",
+            },
         }
+
+        if frame_start is not None:
+            version_data["attrib"]["frameStart"] = frame_start
+        if frame_end is not None:
+            version_data["attrib"]["frameEnd"] = frame_end
 
         if resolution_width is not None and resolution_height is not None:
             version_data["attrib"].update(
@@ -517,6 +554,11 @@ class AyonPublisher:
             version_id: str,
             representation_name: str,
             files: List[str],
+            folder_path: str,
+            product_name: str,
+            product_type: str,
+            version_number: int,
+            publish_root: Dict[str, Any],
             is_sequence: bool = False,
             original_basename: Optional[str] = None,
             tags: List[str] = None,
@@ -546,7 +588,15 @@ class AyonPublisher:
                 "colorspace": colorspace,
                 "originalBasename": original_basename or os.path.basename(files[0]),
                 "isSequence": is_sequence,
-                "context": self._get_context()
+                "context": self._get_context(
+                    project_name,
+                    folder_path,
+                    product_name,
+                    product_type,
+                    representation_name,
+                    version_number,
+                    publish_root,
+                ),
             },
             "status": "Pending review",
             "attrib": {
@@ -568,8 +618,17 @@ class AyonPublisher:
 
         return representation_id
 
-    def _get_context(self) -> Dict[str, Any]:
-        """Build representation context from environment variables."""
+    def _get_context(
+            self,
+            project_name: str,
+            folder_path: str,
+            product_name: str,
+            product_type: str,
+            representation_name: str,
+            version_number: int,
+            publish_root: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build representation context from parameters and environment."""
         ayon_env = {k: v for k, v in os.environ.items() if k.startswith("AYON_")}
 
         user_name = (
@@ -578,18 +637,33 @@ class AyonPublisher:
             or os.getenv("USER")
         )
 
+        folder_parts = folder_path.strip("/").split("/") if folder_path else []
+        asset_name = folder_parts[-1] if folder_parts else ""
+        hierarchy = "/".join(folder_parts[:-1]) if len(folder_parts) > 1 else ""
+
         context = {
-            "project": {"name": ayon_env.get("AYON_PROJECT_NAME"), "code": "epi"},
-            "folder": {"path": ayon_env.get("AYON_FOLDER_PATH")},
+            "asset": asset_name,
+            "subset": product_name,
+            "hierarchy": hierarchy,
+            "project": {
+                "name": project_name,
+                "code": ayon_env.get("AYON_PROJECT_CODE", project_name[:3]),
+            },
+            "folder": {
+                "path": folder_path,
+                "name": asset_name,
+                "parents": folder_parts[:-1],
+            },
+            "product": {"name": product_name, "type": product_type},
+            "representation": representation_name,
             "task": {"name": ayon_env.get("AYON_TASK_NAME")},
-            "user": {"name": user_name} if user_name else {},
+            "user": user_name,
+            "username": user_name,
+            "version": version_number,
+            "root": {"publish": publish_root.get("windows")},
         }
 
-        cleaned = {
-            k: v
-            for k, v in context.items()
-            if v and all(vv is not None for vv in v.values())
-        }
+        cleaned = {k: v for k, v in context.items() if v not in (None, "", {})}
         return cleaned
 
     def _publish_sequence(
@@ -656,6 +730,11 @@ class AyonPublisher:
             version_id=version_id,
             representation_name=representation_name,
             files=sequence_publish_paths,
+            folder_path=folder_path,
+            product_name=product_name,
+            product_type=product_type,
+            version_number=version_number,
+            publish_root=publish_root,
             is_sequence=True,
             original_basename=representation_name,
             tags=["review", "sequence"],
@@ -723,6 +802,11 @@ class AyonPublisher:
             version_id=version_id,
             representation_name=representation_name,
             files=[publish_path],
+            folder_path=folder_path,
+            product_name=product_name,
+            product_type=product_type,
+            version_number=version_number,
+            publish_root=publish_root,
             is_sequence=False,
             template=template,
             original_basename=os.path.splitext(os.path.basename(file_path))[0],
