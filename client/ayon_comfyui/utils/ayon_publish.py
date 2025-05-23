@@ -66,6 +66,7 @@ class AyonPublisher:
             folder_path: AYON folder path
             product_name: Name of the product to create or use
             product_type: Type of product (default: "image")
+            task_name: Name of the task for context information
             representation_names: List of representation names (derived from file extensions if None)
             description: Optional description for the version
 
@@ -192,6 +193,7 @@ class AyonPublisher:
                         folder_type,
                         product_name,
                         product_type,
+                        task_name,
                         files[0],
                         representation_name,
                         file_ext,
@@ -491,8 +493,13 @@ class AyonPublisher:
             frame: str = "",
             output: str = "",
             task_name: str = "",
-    ) -> str:
-        """Construct publish path using anatomy templates, handling empty optional fields."""
+    ) -> Tuple[str, str]:
+        """Construct publish path using anatomy templates.
+
+        The ``task_name`` parameter is injected into template data.  The
+        resulting template string used for path formatting is returned along
+        with the final publish path.
+        """
         self.logger.info("[PATH] Constructing publish path")
         try:
             self.logger.debug(f"[PATH] Using template: {template}")
@@ -568,6 +575,9 @@ class AyonPublisher:
                 )
 
             publish_path = os.path.normpath(os.path.join(publish_dir, filename))
+            template_string = os.path.normpath(
+                os.path.join(directory_template, file_template)
+            )
             self.logger.debug(f"[PATH] Publish directory: {publish_dir}")
             self.logger.debug(f"[PATH] Filename: {filename}")
             self.logger.info(f"[PATH] Full publish path: {publish_path}")
@@ -576,7 +586,7 @@ class AyonPublisher:
             os.makedirs(publish_dir, exist_ok=True)
             self.logger.info("[PATH] Directory structure created")
 
-            return publish_path
+            return publish_path, template_string
         except Exception as e:
             self.logger.error(f"Failed to construct publish path: {str(e)}")
             raise
@@ -594,6 +604,7 @@ class AyonPublisher:
             version_number: int,
             publish_root: Dict[str, Any],
             root_paths: Dict[str, Any],
+            task_name: str = "",
             is_sequence: bool = False,
             original_basename: Optional[str] = None,
             tags: List[str] = None,
@@ -602,7 +613,12 @@ class AyonPublisher:
             resolution_width: Optional[int] = None,
             resolution_height: Optional[int] = None,
     ) -> str:
-        """Create a representation with the given files."""
+        """Create a representation with the given files.
+
+        Args include ``task_name`` to set context information. The ``template``
+        argument should contain the formatted template string returned by
+        :func:`_construct_publish_path`.
+        """
         self.logger.info(f"[REPRESENTATION] Creating representation '{representation_name}'")
 
         file_entries = []
@@ -633,12 +649,13 @@ class AyonPublisher:
                     representation_name,
                     version_number,
                     root_paths,
+                    task_name,
                 ),
             },
             "status": "Pending review",
             "attrib": {
                 "path": file_entries[0]["path"],
-                "template": "{root[publish]}/{project[name]}/{hierarchy}/{folder[name]}/{product[type]}/{task[name]}/{product[name]}/v{version:0>3}/{project[code]}_{folder[name]}_{product[name]}_v{version:0>3}<_{output}><.{frame:0>4}>_fox_submission_logic.{ext}"
+                "template": template,
             }
         }
         rep_data["data"]["context"]["ext"] = os.path.splitext(files[0])[1].lstrip('.')
@@ -665,8 +682,12 @@ class AyonPublisher:
             representation_name: str,
             version_number: int,
             root_paths: Dict[str, Any],
+            task_name: str = "",
     ) -> Dict[str, Any]:
-        """Build representation context from parameters and environment."""
+        """Build representation context from parameters and environment.
+
+        The ``task_name`` argument overrides ``AYON_TASK_NAME`` if provided.
+        """
         ayon_env = {k: v for k, v in os.environ.items() if k.startswith("AYON_")}
 
         user_name = (
@@ -700,7 +721,7 @@ class AyonPublisher:
             "product": {"name": product_name, "type": product_type},
             "representation": representation_name,
             "task": {
-                "name": ayon_env.get("AYON_TASK_NAME"),
+                "name": task_name or ayon_env.get("AYON_TASK_NAME"),
                 "type": ayon_env.get("AYON_TASK_TYPE"),
                 "short": ayon_env.get("AYON_TASK_SHORT"),
             },
@@ -754,7 +775,7 @@ class AyonPublisher:
             frame = f"{frame_num:04d}"
 
             # Construct publish path for each frame
-            publish_path = self._construct_publish_path(
+            publish_path, template_string = self._construct_publish_path(
                 file_path=file_path,
                 project_name=project_name,
                 folder_path=folder_path,
@@ -788,10 +809,11 @@ class AyonPublisher:
             version_number=version_number,
             publish_root=publish_root,
             root_paths=root_paths,
+            task_name=task_name,
             is_sequence=True,
             original_basename=representation_name,
             tags=["review", "sequence"],
-            template=template,
+            template=template_string,
             resolution_width=res_w,
             resolution_height=res_h,
         )
@@ -815,6 +837,7 @@ class AyonPublisher:
             folder_type: Optional[str],
             product_name: str,
             product_type: str,
+            task_name: str,
             file_path: str,
             representation_name: str,
             file_ext: str,
@@ -824,7 +847,7 @@ class AyonPublisher:
             publish_root: Dict[str, Any],
             root_paths: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Publish a single file."""
+        """Publish a single file with optional ``task_name`` for context."""
         res_w = res_h = None
         try:
             with Image.open(file_path) as img:
@@ -833,10 +856,11 @@ class AyonPublisher:
             pass
 
         # Construct publish path
-        publish_path = self._construct_publish_path(
+        publish_path, template_string = self._construct_publish_path(
             file_path=file_path,
             project_name=project_name,
             folder_path=folder_path,
+            task_name=task_name,
             product_name=product_name,
             product_type=product_type,
             representation_name=representation_name,
@@ -864,8 +888,9 @@ class AyonPublisher:
             version_number=version_number,
             publish_root=publish_root,
             root_paths=root_paths,
+            task_name=task_name,
             is_sequence=False,
-            template=template,
+            template=template_string,
             original_basename=os.path.splitext(os.path.basename(file_path))[0],
             resolution_width=res_w,
             resolution_height=res_h,
